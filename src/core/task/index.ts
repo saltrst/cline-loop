@@ -83,6 +83,7 @@ import { HostProvider } from "@/hosts/host-provider"
 import { TerminalProcessResultPromise } from "@/hosts/vscode/terminal/VscodeTerminalProcess"
 import { isSubagentCommand, transformClineCommand } from "@/integrations/cli-subagents/subagent_command"
 import { StandaloneTerminalManager } from "@/integrations/terminal"
+import { SasDeterminacyState, SasOrchestrator } from "@/sas/SasOrchestrator"
 import { ClineError, ClineErrorType, ErrorService } from "@/services/error"
 import { featureFlagsService } from "@/services/feature-flags"
 import { TerminalHangStage, TerminalUserInterventionAction, telemetryService } from "@/services/telemetry"
@@ -145,11 +146,15 @@ export class Task {
 	private taskIsFavorited?: boolean
 	private cwd: string
 	private taskInitializationStartTime: number
+	private initialTaskText?: string
 
 	taskState: TaskState
 
 	// ONE mutex for ALL state modifications to prevent race conditions
 	private stateMutex = new Mutex()
+
+	// SAS container orchestrator
+	private sasOrchestrator: SasOrchestrator
 
 	/**
 	 * Execute function with exclusive lock on all task state
@@ -157,6 +162,31 @@ export class Task {
 	 */
 	private async withStateLock<T>(fn: () => T | Promise<T>): Promise<T> {
 		return await this.stateMutex.withLock(fn)
+	}
+
+	private async syncSasUserIntent(intent?: string, attachments?: { files?: string[]; images?: string[] }) {
+		try {
+			await this.sasOrchestrator.ensureInitialized()
+			await this.sasOrchestrator.recordUserIntent(intent ?? this.initialTaskText ?? "", attachments)
+		} catch (error) {
+			Logger.error("[Task] Failed to sync SAS task intent", error)
+		}
+	}
+
+	private async recordSasSayEvent(type: ClineSay, text?: string, partial?: boolean) {
+		try {
+			await this.sasOrchestrator.recordSayEvent({ type, text, partial })
+		} catch (error) {
+			Logger.error("[Task] Failed to record SAS say event", error)
+		}
+	}
+
+	private async setSasPhase(phase: "instantiator" | "planner" | "implementer", reason?: string): Promise<void> {
+		try {
+			await this.sasOrchestrator.setPhase(phase, reason)
+		} catch (error) {
+			Logger.error("[Task] Failed to update SAS phase", error)
+		}
 	}
 
 	/**
@@ -286,6 +316,7 @@ export class Task {
 		this.cancelTask = cancelTask
 		this.clineIgnoreController = new ClineIgnoreController(cwd)
 		this.taskLockAcquired = taskLockAcquired
+		this.initialTaskText = task || historyItem?.task || ""
 
 		// Determine terminal execution mode and create appropriate terminal manager
 		this.terminalExecutionMode = vscodeTerminalExecutionMode || "vscodeTerminal"
@@ -315,6 +346,15 @@ export class Task {
 		this.cwd = cwd
 		this.stateManager = stateManager
 		this.workspaceManager = workspaceManager
+
+		const sasTitle = (task || historyItem?.task || `Task ${taskId}`).slice(0, 120)
+		this.sasOrchestrator = new SasOrchestrator({
+			workspaceRoot: cwd,
+			containerId: taskId,
+			title: sasTitle,
+			initialTask: this.initialTaskText || undefined,
+			scopePaths: ["."],
+		})
 
 		// Set up MCP notification callback for real-time notifications
 		this.mcpHub.setNotificationCallback(async (serverName: string, _level: string, message: string) => {
@@ -663,6 +703,19 @@ export class Task {
 			images: this.taskState.askResponseImages,
 			files: this.taskState.askResponseFiles,
 		}
+
+		// Persist fresh user intent into the SAS container when the user responds
+		if (result.text || result.images?.length || result.files?.length) {
+			try {
+				await this.syncSasUserIntent(result.text, {
+					images: result.images,
+					files: result.files,
+				})
+			} catch (error) {
+				Logger.error("[Task] Failed to sync SAS intent from ask response", error)
+			}
+		}
+
 		this.taskState.askResponse = undefined
 		this.taskState.askResponseText = undefined
 		this.taskState.askResponseImages = undefined
@@ -709,6 +762,7 @@ export class Task {
 					lastMessage.partial = partial
 					const protoMessage = convertClineMessageToProto(lastMessage)
 					await sendPartialMessageEvent(protoMessage)
+					void this.recordSasSayEvent(type, text, partial)
 					return undefined
 				} else {
 					// this is a new partial message, so add it with partial state
@@ -725,6 +779,7 @@ export class Task {
 						modelInfo,
 					})
 					await this.postStateToWebview()
+					void this.recordSasSayEvent(type, text, partial)
 					return sayTs
 				}
 			} else {
@@ -743,6 +798,7 @@ export class Task {
 					// await this.postStateToWebview()
 					const protoMessage = convertClineMessageToProto(lastMessage)
 					await sendPartialMessageEvent(protoMessage) // more performant than an entire postStateToWebview
+					void this.recordSasSayEvent(type, text, partial)
 					return undefined
 				} else {
 					// this is a new partial=false message, so add it like normal
@@ -758,6 +814,7 @@ export class Task {
 						modelInfo,
 					})
 					await this.postStateToWebview()
+					void this.recordSasSayEvent(type, text, partial)
 					return sayTs
 				}
 			}
@@ -775,6 +832,7 @@ export class Task {
 				modelInfo,
 			})
 			await this.postStateToWebview()
+			void this.recordSasSayEvent(type, text, partial)
 			return sayTs
 		}
 	}
@@ -917,6 +975,10 @@ export class Task {
 		// if the extension process were killed, then on restart the clineMessages might not be empty, so we need to set it to [] when we create a new Cline client (otherwise webview would show stale messages from previous session)
 		this.messageStateHandler.setClineMessages([])
 		this.messageStateHandler.setApiConversationHistory([])
+
+		this.initialTaskText = task || this.initialTaskText
+		await this.syncSasUserIntent(this.initialTaskText, { files, images })
+		await this.setSasPhase("instantiator", "Task created")
 
 		await this.postStateToWebview()
 
@@ -1086,6 +1148,9 @@ export class Task {
 
 		this.taskState.isInitialized = true
 		this.taskState.abort = false // Reset abort flag when resuming task
+
+		await this.syncSasUserIntent(this.initialTaskText)
+		await this.setSasPhase("instantiator", "Task resumed")
 
 		const { response, text, images, files } = await this.ask(askType) // calls poststatetowebview
 
@@ -2143,12 +2208,27 @@ export class Task {
 			maxConsecutiveMistakes: this.stateManager.getGlobalSettingsKey("maxConsecutiveMistakes"),
 		})
 
+		let sasInstructions: string | undefined
+		let sasState: SasDeterminacyState | undefined
+		try {
+			sasState = await this.sasOrchestrator.getDeterminacyState()
+			if (sasState.readyForPlanning) {
+				await this.setSasPhase("planner", "Building system prompt and plan context")
+			} else {
+				await this.setSasPhase("instantiator", "Mapping layer or invariants incomplete")
+			}
+			sasInstructions = await this.sasOrchestrator.getSpecInstructions()
+		} catch (error) {
+			Logger.error("[Task] Failed to load SAS spec for system prompt", error)
+		}
+
 		const promptContext: SystemPromptContext = {
 			cwd: this.cwd,
 			ide,
 			providerInfo,
 			supportsBrowserUse,
 			mcpHub: this.mcpHub,
+			sasInstructions,
 			focusChainSettings: this.stateManager.getGlobalSettingsKey("focusChainSettings"),
 			globalClineRulesFileInstructions,
 			localClineRulesFileInstructions,
@@ -2454,7 +2534,33 @@ export class Task {
 						this.initialCheckpointCommitPromise = undefined
 					}
 				}
-				await this.toolExecutor.executeTool(block)
+				try {
+					await this.setSasPhase("implementer", "Requested tool execution")
+				} catch (error) {
+					Logger.error("[Task] Failed to update SAS phase before tool execution", error)
+				}
+
+				try {
+					const validation = await this.sasOrchestrator.validatePlannedToolExecution(block.name)
+					if (!validation.allowed) {
+						await this.say("error", `SAS blocked tool '${block.name}': ${validation.reason ?? "outside plan"}`)
+						this.taskState.didRejectTool = true
+						this.taskState.userMessageContentReady = true
+						return
+					}
+
+					await this.toolExecutor.executeTool(block)
+
+					if (validation.planItemId) {
+						await this.sasOrchestrator.markPlanStepComplete(validation.planItemId, `Executed tool ${block.name}`)
+					}
+				} catch (error) {
+					Logger.error("[Task] SAS plan enforcement failed", error)
+					await this.say("error", `SAS orchestration failed while executing tool '${block.name}': ${String(error)}`)
+					this.taskState.didRejectTool = true
+					this.taskState.userMessageContentReady = true
+					return
+				}
 				break
 		}
 
