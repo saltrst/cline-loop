@@ -96,6 +96,7 @@ export interface SystemPromptContext {
 	readonly ide: string
 	readonly supportsBrowserUse?: boolean
 	readonly mcpHub?: McpHub
+	readonly sasInstructions?: string
 	readonly focusChainSettings?: FocusChainSettings
 	readonly globalClineRulesFileInstructions?: string
 	readonly localClineRulesFileInstructions?: string
